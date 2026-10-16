@@ -74,6 +74,33 @@ except PolicyDenied as e:
   must fire on a resource with no tags at all, or every untagged resource walks
   through the check written to catch it.
 
+## Traces
+
+Enforcement emits a trace per tool call to the control plane — verdict, which
+tier decided it, duration, and the audit hash. Off if `MAVOPS_API_TOKEN` is
+unset; disable explicitly with `AEGRAIL_TRACES_DISABLED=1`.
+
+```python
+agent = Agent(
+    identity="my-agent/v1",
+    trace_arguments=True,                     # default False — see below
+    agent_id="3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+)
+```
+
+- **`trace_arguments` is off by default and should usually stay off.**
+  Enforcement always evaluates the real arguments; this only controls whether
+  they are *shipped*. Tool arguments are where personal data lives.
+- **`agent_id` must be a UUID.** The control plane parses it as one and
+  discards anything else, leaving traces unlinked. The SDK warns if you pass a
+  non-UUID rather than letting it fail silently.
+- **Traces flush on exit.** `start()` registers an `atexit` hook and `stop()`
+  drains the queue with a bounded timeout, so a short-lived agent process does
+  not lose its telemetry. You do not normally need to call `stop()`.
+- **Self-hosted or cloud is one environment variable.** `MAVOPS_API_BASE`
+  defaults to the hosted control plane; point it at your own cluster and
+  nothing else changes.
+
 ## Onboarding an agent whose behaviour you don't know
 
 ```python

@@ -13,16 +13,27 @@ losing one is acceptable, blocking a tool call to record one is not.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue
+import re
 import threading
 import urllib.error
 import urllib.request
+import warnings
 from datetime import datetime, timezone
 from typing import Optional
 
 from .credentials import CredentialSource
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+def _looks_like_uuid(value: str) -> bool:
+    return bool(_UUID_RE.match(value))
 
 
 class TraceClient:
@@ -40,6 +51,17 @@ class TraceClient:
         ).rstrip("/")
         self.credentials = credentials or CredentialSource()
         self.agent_id = agent_id or os.environ.get("MAVOPS_AGENT_ID", "")
+        # The control plane parses this as a UUID and drops it silently when it
+        # is not one — traces still arrive, just unlinked from any agent, which
+        # looks like a server bug from the outside. Say so here instead.
+        if self.agent_id and not _looks_like_uuid(self.agent_id):
+            warnings.warn(
+                f"MAVOPS_AGENT_ID={self.agent_id!r} is not a UUID; the control "
+                "plane will discard it and these traces will not be linked to "
+                "an agent.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.enabled = os.environ.get("AEGRAIL_TRACES_DISABLED", "").lower() not in (
             "1",
             "true",
@@ -59,10 +81,27 @@ class TraceClient:
             target=self._drain, daemon=True, name="aegrail-traces"
         )
         self._worker.start()
+        # The common shape of an agent in production is a process that does its
+        # work and exits. The worker is a daemon, so without this every trace
+        # still queued at that moment is discarded — and silently, which is the
+        # worst way to lose telemetry: the dashboard just looks quiet.
+        atexit.register(self.stop)
         return self
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
+        """Flush what is queued, then stop the worker.
+
+        Blocks up to `timeout` seconds. Telemetry must not hang a process on
+        the way out, so the join is bounded and anything still unsent past the
+        deadline is abandoned — but the normal case now flushes instead of
+        dropping. Idempotent: calling it twice, or after atexit has run, is a
+        no-op.
+        """
+        worker, self._worker = self._worker, None
+        if worker is None:
+            return
         self._stop.set()
+        worker.join(timeout=timeout)
 
     # ── emit ────────────────────────────────────────────────────────
     def record(
@@ -115,10 +154,15 @@ class TraceClient:
 
     # ── worker ──────────────────────────────────────────────────────
     def _drain(self) -> None:
-        while not self._stop.is_set():
+        # Exit only when asked to stop AND the queue is empty, so a stop()
+        # flushes the backlog rather than discarding it. The short poll keeps
+        # shutdown responsive without busy-waiting.
+        while True:
             try:
-                body = self._q.get(timeout=1.0)
+                body = self._q.get(timeout=0.25)
             except queue.Empty:
+                if self._stop.is_set():
+                    return
                 continue
             try:
                 self._post(body)

@@ -80,6 +80,8 @@ class Agent:
         capability: Optional[CapabilityGrant] = None,
         strict_capability: bool = False,
         mode: Mode = Mode.ENFORCE,
+        trace_arguments: bool = False,
+        agent_id: Optional[str] = None,
     ):
         self.identity = identity
         self.budget = budget or Budget()
@@ -87,6 +89,11 @@ class Agent:
             os.environ.get("AEGRAIL_AUDIT_PATH", "./audit.jsonl")
         )
         self.hitl_timeout_seconds = hitl_timeout_seconds
+        # Off by default, and it stays that way. Tool arguments are where the
+        # personal data lives — claim numbers, account ids, addresses — so
+        # shipping them to a control plane is a decision a person makes
+        # deliberately for a given agent, not a default they inherit.
+        self.trace_arguments = trace_arguments
         self._tools: dict[str, _ToolSpec] = {}
 
         self.hitl = hitl or HITLClient()
@@ -132,7 +139,9 @@ class Agent:
         # Every contract decision is also a trace. The runtime already
         # saw the call in order to rule on it, so the telemetry is a
         # byproduct of enforcement rather than a second integration.
-        self.traces = TraceClient(credentials=self.policy.credentials).start()
+        self.traces = TraceClient(
+            credentials=self.policy.credentials, agent_id=agent_id
+        ).start()
 
         # Durable record of anything this agent is waiting on, so an
         # approval that lands after a restart is still carried out.
@@ -338,6 +347,18 @@ class Agent:
     def tools(self) -> dict:
         return dict(self._tools)
 
+    def _traced_args(self, call_args: dict) -> dict:
+        """Arguments for the trace payload, or nothing.
+
+        Enforcement always sees the real arguments — rules are evaluated
+        against them regardless. This only governs what is *shipped* to the
+        control plane, which is a separate decision with a separate blast
+        radius: the audit chain stays local, a trace does not.
+        """
+        if not self.trace_arguments:
+            return {}
+        return {"arguments": call_args}
+
     # ── enforcement ─────────────────────────────────────────────────
     def call_tool(self, name: str, /, *args: Any, **kwargs: Any) -> Any:
         # `name` is positional-only. Without the slash, a tool with its own
@@ -405,7 +426,11 @@ class Agent:
                     tool_names=[name],
                     session_id=self.identity,
                     error_message=decision.why(),
-                    payload={"audit_hash": event["hash"], **decision.to_audit()},
+                    payload={
+                        "audit_hash": event["hash"],
+                        **decision.to_audit(),
+                        **self._traced_args(call_args),
+                    },
                 )
                 raise PolicyDenied(name, decision.why())
 
@@ -433,6 +458,7 @@ class Agent:
                 tool_names=[name],
                 session_id=self.identity,
                 payload={
+                    **self._traced_args(call_args),
                     "verdict": "allowed",
                     # Which layer settled it. Only the deny path recorded this,
                     # so an allowed call gave no way to tell whether the
