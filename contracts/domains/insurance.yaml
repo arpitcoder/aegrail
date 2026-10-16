@@ -1,0 +1,263 @@
+# Insurance — domain contract pack
+#
+# Layers on top of infra-baseline.yaml, which already covers the destructive
+# actions common to every domain (deletes, force flags, wildcard IAM, SQL
+# without WHERE). Nothing here repeats those. This file encodes only what is
+# specific to an agent acting on policies, claims and policyholders.
+#
+# The shape of risk here is different from observability, and that difference
+# is the reason domain packs exist at all. An observability agent's worst day
+# is a five-figure query bill or leaked telemetry. An insurance agent's worst
+# day is a wrongly denied claim, a regulator asking who authorised an
+# automated adverse decision, or protected-class data reaching an underwriting
+# model. Almost none of that is destructive in the infrastructure sense — the
+# records survive; the harm is to a person and to the licence to operate.
+#
+# Three principles behind the verdicts below:
+#
+#   Money out is a threshold problem, not a boolean. Paying a claim is the
+#   agent's job. Paying an unusually large one without a human is not.
+#
+#   Adverse decisions need a human in the loop, because most jurisdictions
+#   require an insurer to explain a denial and to have a person accountable
+#   for it. This is a compliance boundary before it is a safety one.
+#
+#   Protected attributes must never reach a pricing or eligibility decision.
+#   That is illegal in most markets, and the failure is silent — a model that
+#   receives the field will use it, and nobody notices until discovery.
+#
+# Tool naming assumes verb_noun (`approve_payout`, `read_claim`). Patterns are
+# used where a customer's naming is unlikely to match ours exactly; tighten
+# them to real tool names once shadow mode has recorded the actual inventory.
+
+# ── Layer 2: capability grant ────────────────────────────────────────
+# The tools a claims-handling agent may hold. Deliberately excluded, because
+# an agent that assesses claims has no business doing any of them:
+#
+#   cancel_policy / rescind_policy  — ending someone's cover is a human act
+#   update_premium / refile_rate    — rates are filed with a regulator
+#   delete_claim / purge_record     — insurance records have retention duties
+#   export_bulk                     — no single claim needs a bulk export
+#
+# Override per deployment. An underwriting agent legitimately needs pricing
+# tools this one must never touch, and should carry its own grant.
+allowedTools:
+  - read_policy
+  - read_claim
+  - read_policyholder
+  - search_claims
+  - assess_claim
+  - request_document
+  - approve_payout
+  - deny_claim
+  - flag_fraud
+  - write_note
+  - notify_policyholder
+
+argumentRules:
+
+  # ── Money leaving the business ──────────────────────────────────────
+  # An agent settling routine claims is the entire point; the risk is scale.
+  # Two thresholds rather than one: a band where a human signs off, and a
+  # ceiling no agent crosses regardless of approval, because an unattended
+  # process should never be one prompt away from a very large transfer.
+
+  - tool: "approve_payout"
+    arg: "amount"
+    gt: 10000
+    verdict: "hitl"
+    reason: "payout above the unattended settlement limit"
+
+  - tool: "approve_payout"
+    arg: "amount"
+    gt: 250000
+    verdict: "deny"
+    reason: "payout exceeds any automated authority — requires manual processing"
+
+  # present: false fires when the argument is ABSENT. A payout call with no
+  # amount is either a bug or an attempt to let a default through, and neither
+  # should settle money. (present: true would fire on every payout that HAS an
+  # amount — i.e. all of them.)
+  - tool: "approve_payout"
+    arg: "amount"
+    present: false
+    verdict: "hitl"
+    reason: "payout with no amount specified"
+
+  - tool: "approve_payout"
+    arg: "currency"
+    not_in: ["USD", "GBP", "EUR", "INR"]
+    verdict: "hitl"
+    reason: "settlement in an unexpected currency"
+
+  # Paying someone other than the policyholder is the classic diversion
+  # pattern, and it looks like an ordinary approval on every per-call check.
+  - tool: "approve_payout"
+    arg: "payee_matches_policyholder"
+    ne: "true"
+    verdict: "hitl"
+    reason: "payee is not the policyholder on record"
+
+  - tool: "*_payout*"
+    arg: "expedite"
+    eq: "true"
+    verdict: "hitl"
+    reason: "expedited settlement skips the standard verification window"
+
+  # ── Adverse decisions ───────────────────────────────────────────────
+  # A denial is a regulated act. Most jurisdictions require a stated reason,
+  # a named decision-maker and an appeals path. An agent may prepare one; a
+  # person owns it.
+
+  - tool: "deny_claim"
+    verdict: "hitl"
+    reason: "claim denial is an adverse decision requiring human authorisation"
+
+  - tool: "deny_claim"
+    arg: "reason_code"
+    present: false
+    verdict: "deny"
+    reason: "denial without a reason code cannot be explained to the policyholder or a regulator"
+
+  # Accusing a customer of fraud follows them across the industry through
+  # shared databases, and is close to impossible to undo.
+  - tool: "flag_fraud"
+    verdict: "hitl"
+    reason: "fraud flags propagate to industry-shared registers and are effectively permanent"
+
+  - tool: "*_cancel*"
+    verdict: "hitl"
+    reason: "cancelling cover leaves a policyholder unprotected"
+
+  - tool: "*_rescind*"
+    verdict: "deny"
+    reason: "rescission voids cover retroactively — never automatable"
+
+  # ── Protected attributes ────────────────────────────────────────────
+  # Using these in pricing or eligibility is unlawful in most markets. The
+  # failure mode is silent: a model handed the field will use it, and it
+  # surfaces years later in discovery. Deny rather than review — there is no
+  # version of this a human should wave through in the moment.
+
+  - tool: "*assess*"
+    arg: "race"
+    present: true
+    verdict: "deny"
+    reason: "protected attribute supplied to an assessment decision"
+
+  - tool: "*assess*"
+    arg: "religion"
+    present: true
+    verdict: "deny"
+    reason: "protected attribute supplied to an assessment decision"
+
+  - tool: "*assess*"
+    arg: "genetic_data"
+    present: true
+    verdict: "deny"
+    reason: "genetic information in an underwriting or claims decision"
+
+  - tool: "*price*"
+    arg: "ethnicity"
+    present: true
+    verdict: "deny"
+    reason: "protected attribute supplied to a pricing decision"
+
+  # ── Policyholder data ───────────────────────────────────────────────
+  # Claims files carry medical records, financial history and identifiers.
+  # The risk is bulk movement, not individual access — an agent handling one
+  # claim reads one file.
+
+  - tool: "search_claims"
+    arg: "limit"
+    outside: [1, 100]
+    verdict: "hitl"
+    reason: "bulk claim retrieval — an agent handling one case does not need many"
+
+  - tool: "*_export*"
+    verdict: "hitl"
+    reason: "export moves policyholder data out of the system of record"
+
+  - tool: "read_policyholder"
+    arg: "include_medical"
+    eq: "true"
+    verdict: "hitl"
+    reason: "medical records carry additional handling obligations"
+
+  # Data residency. Insurance data is frequently subject to a hard
+  # localisation requirement rather than a transfer-mechanism one.
+  - tool: "*"
+    arg: "destination_region"
+    not_in: ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1"]
+    only_if_present: true
+    verdict: "deny"
+    reason: "policyholder data leaving an approved jurisdiction"
+
+  # ── Third-party data ────────────────────────────────────────────────
+  # Pulling a credit report is a regulated act with its own consent and
+  # notice requirements, and it leaves a footprint on the consumer's file.
+
+  - tool: "*credit_report*"
+    verdict: "hitl"
+    reason: "credit pulls require a permissible purpose and leave a record on the consumer's file"
+
+  - tool: "*_notify*"
+    arg: "recipient_count"
+    gt: 50
+    verdict: "hitl"
+    reason: "bulk policyholder communication"
+
+sequenceRules:
+
+  # A claims agent legitimately reads sensitive files. What it must never do
+  # is read them and then send something outward — neither call is wrong on
+  # its own, which is precisely why no per-call rule sees it.
+  - afterAny: ["read_claim*", "read_policyholder*", "search_claims*", "*_medical*"]
+    then: "http_*"
+    verdict: "deny"
+    withinSeconds: 600
+    reason: "outbound request shortly after reading policyholder data"
+
+  - afterAny: ["read_claim*", "read_policyholder*", "*_medical*"]
+    then: "*_export*"
+    verdict: "deny"
+    withinSeconds: 600
+    reason: "export shortly after reading a policyholder file"
+
+  # Denying a claim and then immediately closing or archiving it removes the
+  # window in which the decision would normally be reviewed.
+  - afterAny: ["deny_claim*"]
+    then: "*_close*"
+    verdict: "hitl"
+    withinSeconds: 300
+    reason: "closing a claim immediately after denial forecloses review"
+
+  - afterAny: ["deny_claim*", "flag_fraud*"]
+    then: "notify_*"
+    verdict: "hitl"
+    withinSeconds: 300
+    reason: "notifying a policyholder of an adverse decision before a human has confirmed it"
+
+  # Reading the payout limits and then approving a payout is the shape of an
+  # agent working out what it can get away with. Legitimate handling does not
+  # need to consult the threshold first.
+  - afterAny: ["*_limit*", "*_threshold*", "read_authority*"]
+    then: "approve_payout*"
+    verdict: "hitl"
+    withinSeconds: 300
+    reason: "payout approved immediately after inspecting approval limits"
+
+  # Credentials, then anything. Same rule as every other pack; it is here
+  # because packs are applied independently and this must not be optional.
+  - afterAny: ["get_credentials*", "read_secret*", "list_keys*"]
+    then: "*"
+    verdict: "hitl"
+    withinSeconds: 900
+    reason: "action taken shortly after reading credentials"
+
+# Tier 3 is consulted only for tools whose risk lives in free-form arguments
+# that no rule above can read — a claims note, an assessment rationale.
+judge:
+  inspectTools:
+    - "assess_claim"
+    - "write_note"

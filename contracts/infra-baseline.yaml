@@ -1,0 +1,178 @@
+# Baseline argument rules for agents that touch cloud infrastructure.
+#
+# Tier 2 of the MavOps contract: deterministic checks on the actual
+# arguments of a call. Every rule here runs in microseconds, needs no
+# model, and replays identically a year later — which is what makes an
+# evidence pack defensible.
+#
+# Rules may only escalate. There is no `verdict: allow`, by design: this
+# tier exists to catch what the structural layer let through, never to
+# overrule it.
+#
+# Ship this as a starting point and tighten it per customer. The
+# namespaces, account ids and instance classes below are examples.
+
+argumentRules:
+
+  # ── Blast radius: where the action lands ───────────────────────────
+  # Most infrastructure danger is expressible through namespaces, tags
+  # and resource names. No semantic reasoning required.
+
+  - tool: "k8s_delete_*"
+    arg: namespace
+    in: [kube-system, kube-public, mavops, prod, production]
+    verdict: deny
+    reason: "protected namespace — deleting here takes the platform down"
+
+  - tool: "k8s_*"
+    arg: namespace
+    matches: "^(prod|production)"
+    verdict: hitl
+    reason: "action targets a production namespace"
+
+  # The fail-safe inversion, and the single most useful rule in this
+  # file: an action is safe only if something positively says so. A
+  # resource carrying no tags at all is caught, which is the case a
+  # naive "deny if env=prod" rule misses entirely.
+  - tool: "*_delete"
+    arg: tags.ephemeral
+    ne: "true"
+    verdict: hitl
+    reason: "resource is not tagged ephemeral — assume it is load-bearing"
+
+  - tool: "*"
+    arg: tags.protected
+    eq: "true"
+    verdict: deny
+    reason: "resource is explicitly marked protected"
+
+  # ── Availability: actions that cause an outage without deleting ────
+  # Deleting is not the only irreversible-feeling action. Scaling to
+  # zero, draining a node, or disabling a backup all take something
+  # away, and none of them are a "delete" call.
+
+  - tool: scale_deployment
+    arg: replicas
+    lt: 1
+    verdict: hitl
+    reason: "scaling to zero takes the service offline"
+
+  - tool: "*"
+    arg: force
+    eq: true
+    verdict: hitl
+    reason: "force skips the safety checks the platform would otherwise run"
+
+  - tool: "k8s_drain_node"
+    verdict: hitl
+    reason: "draining a node evicts every workload on it"
+
+  - tool: "*_disable_backup*"
+    verdict: deny
+    reason: "disabling backups removes the ability to undo anything else"
+
+  # ── Cost: actions that are reversible but expensive ────────────────
+  # Nothing is destroyed, so no delete rule fires — but an agent that
+  # provisions a GPU fleet at 3am has still done real damage.
+
+  - tool: "create_instance*"
+    arg: instance_type
+    matches: "^(p3|p4|p5|g5|g6|x2|u-|inf2|trn1)"
+    verdict: hitl
+    reason: "high-cost instance class"
+
+  - tool: "create_instance*"
+    arg: count
+    gt: 10
+    verdict: hitl
+    reason: "bulk provisioning"
+
+  - tool: "*"
+    arg: estimated_monthly_usd
+    gt: 500
+    verdict: hitl
+    reason: "action exceeds the unattended spend ceiling"
+
+  # ── Data: destructive statements a tool name cannot reveal ─────────
+  # execute_sql("SELECT 1") and execute_sql("DROP TABLE users") are the
+  # same tool with the same signature. This is the tier that separates
+  # them, and it does so without a model.
+
+  - tool: "*sql*"
+    arg: "*"
+    matches: "(?i)\\b(DROP|TRUNCATE|ALTER\\s+TABLE)\\b"
+    verdict: deny
+    reason: "schema-destructive SQL"
+
+  - tool: "*sql*"
+    arg: "*"
+    matches: "(?i)\\bDELETE\\s+FROM\\b"
+    verdict: hitl
+    reason: "row-destructive SQL"
+
+  # An unbounded UPDATE or DELETE is the classic three-in-the-morning
+  # mistake: correct syntax, no WHERE clause, whole table rewritten.
+  - tool: "*sql*"
+    arg: "*"
+    matches: "(?i)^\\s*(UPDATE|DELETE)(?!.*\\bWHERE\\b)"
+    verdict: hitl
+    reason: "statement has no WHERE clause — affects every row"
+
+  # ── Identity and access: quiet, permanent, easy to miss ────────────
+
+  - tool: "*"
+    arg: policy_arn
+    matches: "(?i)(AdministratorAccess|PowerUserAccess|\\*)"
+    verdict: deny
+    reason: "grants broad or wildcard permissions"
+
+  - tool: "*_public*"
+    verdict: hitl
+    reason: "makes a resource publicly reachable"
+
+  - tool: "*"
+    arg: acl
+    in: [public-read, public-read-write]
+    verdict: deny
+    reason: "public ACL exposes the resource to the internet"
+
+  # ── Filesystem and egress ──────────────────────────────────────────
+
+  - tool: "write_file"
+    arg: path
+    glob: "/etc/*"
+    verdict: deny
+    reason: "system configuration path"
+
+  - tool: "run_shell"
+    arg: cmd
+    matches: "(?i)(rm\\s+-rf\\s+/|mkfs|dd\\s+if=|:\\(\\)\\{)"
+    verdict: deny
+    reason: "shell command matches a known-destructive pattern"
+
+  # Same rule against the other common spelling. Argument-name matching is
+  # exact, so a tool that calls this parameter `command` rather than `cmd`
+  # bypassed the rule above entirely while looking perfectly well governed.
+  - tool: "run_shell"
+    arg: command
+    matches: "(?i)(rm\\s+-rf\\s+/|mkfs|dd\\s+if=|:\\(\\)\\{)"
+    verdict: deny
+    reason: "shell command matches a known-destructive pattern"
+
+  # ── What this tier deliberately does not attempt ───────────────────
+  #
+  # Two questions are left to Tier 3, because no rule expresses them:
+  #
+  #   Is this resource actually still needed?  A rule can see the tag,
+  #   not whether anything depends on it. Hence the ephemeral inversion
+  #   above: assume load-bearing unless told otherwise.
+  #
+  #   Is this action on-task?  An agent asked to summarise a log that
+  #   begins deleting buckets is compromised, even though each call may
+  #   be individually permitted. That needs the original delegation in
+  #   scope, which is a semantic question.
+  #
+  # And one that no tier here handles: sequence risk. read_secrets is
+  # allowed, http_post is allowed, read_secrets -> http_post is
+  # exfiltration. Per-call evaluation is structurally blind to it. The
+  # hash chain lets you find it afterwards; nothing here prevents it.

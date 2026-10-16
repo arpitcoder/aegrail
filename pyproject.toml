@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegrail"
+version = "0.4.0"
+description = "Runtime contract enforcement for AI agents. Deterministic rules decide; a model may only escalate."
+readme = "README.md"
+license = "MIT"
+# 3.9, not 3.10. The full test suite passes on 3.9 and there is no 3.10-only
+# syntax anywhere in the package — the floor was set by habit, and a lot of
+# enterprise Python is still on 3.9. Excluding them buys nothing.
+requires-python = ">=3.9"
+authors = [{ name = "Arpit Nigam", email = "arpit.nigam.maverick@gmail.com" }]
+keywords = [
+    "ai-agents", "llm", "guardrails", "policy", "security",
+    "runtime-enforcement", "human-in-the-loop", "audit",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+]
+
+# Deliberately empty.
+#
+# This library is installed inside somebody else's production agent. Every
+# dependency it carries is one their security team has to audit, one that can
+# break their build, and one more way a supply-chain problem reaches a process
+# holding real credentials. So the whole SDK is standard library only, down to
+# a hand-rolled Redis protocol client.
+dependencies = []
+
+[project.optional-dependencies]
+# Contracts ship as YAML. Not required: the rule classes accept plain dicts, so
+# an application that already parses its own config needs nothing extra.
+yaml = ["pyyaml>=6.0"]
+# Spans are emitted through a nil-safe shim; without this installed, tracing is
+# a no-op rather than an error.
+otel = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
+dev = ["pytest>=7.0", "pyyaml>=6.0"]
+
+[project.urls]
+Homepage = "https://mavops.xyz"
+Documentation = "https://github.com/arpitcoder/mavops/blob/main/sdk/python/README.md"
+Source = "https://github.com/arpitcoder/mavops"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aegrail"]
+
+[tool.hatch.build.targets.sdist]
+include = ["aegrail", "README.md"]

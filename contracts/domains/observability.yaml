@@ -1,0 +1,229 @@
+# ── Layer 2: capability grant ────────────────────────────────────────
+# The tools an agent of this shape may ever hold. An allowlist: anything
+# absent is denied even if the agent process registers it, so a compromised
+# or careless deploy cannot widen what the agent can reach.
+#
+# Note what is NOT here. `datadog_set_retention` mutates platform
+# configuration — shortening retention destroys telemetry irreversibly and is
+# a plausible way to cover tracks. An analysis agent reads and writes
+# findings; it has no business changing the platform it observes. Layer 3
+# never has to reason about that tool, because layer 2 means the agent does
+# not have it.
+#
+# `http_post` IS granted: publishing a finding to a webhook is legitimate.
+# Whether a *particular* post is acceptable depends on what was read just
+# before it, which is a trajectory question — see sequenceRules below.
+allowedTools:
+  - datadog_query
+  - cloudwatch_query
+  - github_search
+  - write_brief
+  - http_post
+
+# Domain pack — observability and incident-analysis agents.
+#
+# For agents that read telemetry across many sources, reason over it, and
+# produce findings. The shape this pack assumes: dozens of agents, a
+# hundred-odd tools, federated across CloudTrail, CloudWatch, Datadog,
+# GitHub, Grafana, Prometheus, Jira and OpenSearch, running inside a
+# customer's own VPC.
+#
+# That inverts the usual threat model. These agents rarely delete
+# anything, so a delete-focused policy protects nothing. Their risk is
+# concentrated in three places:
+#
+#   1. Reach     one agent holds read credentials to a customer's entire
+#                observability estate
+#   2. Egress    reading is the job; what leaves is the incident
+#   3. Cost      federated search bills per query, and "search 90 days
+#                across every source" is one prompt away
+#
+# Compose with infra-baseline.yaml if the agent also remediates.
+
+argumentRules:
+
+  # ── Cost: the failure that shows up on a bill, not in an alert ─────
+  # CloudWatch Insights, Datadog and OpenSearch all charge per scan.
+  # An agent that widens its own time range while chasing a hypothesis
+  # is behaving reasonably and can still spend five figures overnight.
+
+  - tool: "*_query*"
+    arg: lookback_days
+    gt: 14
+    verdict: hitl
+    reason: "long lookback window — scan cost grows with the range"
+
+  - tool: "*"
+    arg: estimated_scan_gb
+    gt: 100
+    verdict: hitl
+    reason: "large scan — estimated volume is billed per gigabyte"
+
+  - tool: "*_query*"
+    arg: limit
+    outside: [1, 100000]
+    verdict: hitl
+    reason: "unbounded result set"
+
+  # A query with no time bound at all is the expensive one, and it looks
+  # innocuous next to a query that names a wide range.
+  - tool: "*_query*"
+    arg: start_time
+    present: false
+    verdict: hitl
+    reason: "query has no time bound"
+
+  # ── Reach: which sources, and whose data ───────────────────────────
+
+  # Scoped to query tools, and onlyIfPresent, because most calls have no
+  # account_id at all. A negative matcher on tool "*" would fire on every
+  # one of those and deny the entire product — a policy that blocks
+  # everything fails as badly as one that blocks nothing, and looks
+  # responsible while doing it.
+  #
+  # The allowed list is per tenant, so it is substituted at install time.
+  # An unexpanded ${...} left here is rejected when the contract loads
+  # rather than quietly matching nothing.
+  - tool: "*_query*"
+    arg: account_id
+    onlyIfPresent: true
+    notIn: [".REPLACE_WITH_TENANT_ACCOUNT_IDS"]
+    verdict: deny
+    reason: "query targets an account outside this tenant"
+
+  - tool: "*"
+    arg: cross_account
+    eq: true
+    verdict: deny
+    reason: "cross-account access from a tenant-scoped agent"
+
+  # ── Egress: the one that actually matters here ─────────────────────
+  # An observability agent has, by design, read access to everything.
+  # The whole security story is therefore about where data can go, not
+  # what it can read.
+
+  - tool: "http_*"
+    arg: url
+    matches: "^https?://(?!.*\\.internal\\b)"
+    verdict: hitl
+    reason: "outbound request to a non-internal host"
+
+  - tool: "*_upload*"
+    verdict: hitl
+    reason: "upload moves data out of the collection boundary"
+
+  - tool: "*"
+    arg: destination
+    matches: "(?i)(pastebin|transfer\\.sh|file\\.io|ngrok|webhook\\.site)"
+    verdict: deny
+    reason: "destination is a known data-drop service"
+
+  # ── Findings that reach a human ────────────────────────────────────
+  # A Brief or an alert is a write, even though it destroys nothing. An
+  # agent that pages on-call at 3am for a non-incident has done real
+  # damage to trust, and eventually to alerting itself.
+
+  - tool: "*_page*"
+    verdict: hitl
+    reason: "paging a human — confirm this is worth waking someone for"
+
+  - tool: "*_notify*"
+    arg: severity
+    in: [critical, sev1, p1]
+    verdict: hitl
+    reason: "critical-severity notification"
+
+  - tool: "*_notify*"
+    arg: recipients
+    gt: 50
+    verdict: hitl
+    reason: "broad notification fan-out"
+
+  # ── Configuration of the observability estate itself ───────────────
+  # Turning off the thing that would have detected the next problem.
+
+  - tool: "*_delete_*"
+    arg: resource_type
+    in: [dashboard, monitor, alert, slo, retention_policy]
+    verdict: hitl
+    reason: "deleting observability configuration"
+
+  - tool: "*_silence*"
+    arg: duration_hours
+    gt: 24
+    verdict: hitl
+    reason: "long alert silence — muting past the next on-call handover"
+
+  - tool: "*_set_retention*"
+    arg: days
+    lt: 30
+    verdict: deny
+    reason: "shortening retention destroys history needed for audits"
+
+
+sequenceRules:
+
+  # The exfiltration shape. Neither call is wrong on its own, which is
+  # exactly why per-call evaluation never sees it.
+  - afterAny: ["*_query*", "*_search*", "read_*", "get_logs*", "fetch_*"]
+    then: "http_*"
+    verdict: deny
+    withinSeconds: 600
+    reason: "outbound request shortly after reading customer telemetry"
+
+  - afterAny: ["*_query*", "read_*", "*_search*"]
+    then: "*_upload*"
+    verdict: deny
+    withinSeconds: 600
+    reason: "upload shortly after reading customer telemetry"
+
+  - afterAny: ["get_credentials*", "read_secret*", "list_access_keys*"]
+    then: "*"
+    verdict: hitl
+    withinSeconds: 300
+    reason: "any action taken shortly after reading credentials"
+
+  # Silence the alert, then change the thing it was watching.
+  - afterAny: ["*_silence*", "*_disable_monitor*"]
+    then: "*_update*"
+    verdict: hitl
+    withinSeconds: 1800
+    reason: "modification made while monitoring is silenced"
+
+
+judge:
+  # Tier 3 only sees calls the rules above could not settle. Framing
+  # matters: a judge asked the generic "is this destructive?" gives
+  # generically useless answers for a domain where almost nothing is
+  # destructive and the real risk is egress and cost.
+  domain: observability
+  agentPurpose: >
+    This agent reads telemetry from a customer's own systems, correlates
+    it, and produces findings. Reading is expected and normal. Treat with
+    suspicion anything that moves data outward, widens scope beyond the
+    stated investigation, reduces the customer's ability to observe their
+    own systems, or costs materially more than the question warrants.
+  escalateWhen:
+    - the call sends data to a destination not owned by the customer
+    - the scope is far wider than the investigation requires
+    - the call reduces retention, coverage, or alerting
+    - the cost is disproportionate to the question being answered
+    - the action is unrelated to the investigation the agent was given
+
+
+# ── What this pack does not cover ───────────────────────────────────
+#
+# Data content. These rules see arguments, not results. An agent that
+# legitimately reads a log containing PII and then sends it to a hosted
+# model has done nothing this pack can detect — the tool call looked
+# ordinary. That needs redaction at the boundary, which is a different
+# mechanism and is not built yet. For a regulated customer it is likely
+# the first thing procurement asks about.
+#
+# Slow exfiltration. The sequence rules use a time window, so data
+# extracted a little at a time over hours stays under them. Widening the
+# window trades that for false positives on any long-running agent.
+#
+# Aggregate cost. Individual query costs are bounded above; twenty
+# thousand cheap queries are not. That needs a rate and spend meter per
+# session, not a per-call rule.

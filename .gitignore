@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+# Audit chains are generated at runtime and contain whatever the agent did.
+*.jsonl
