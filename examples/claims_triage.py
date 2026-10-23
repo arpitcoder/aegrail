@@ -5,6 +5,14 @@ and leaves a record you can verify afterwards.
 
 No network, no API key, no services. Everything here runs in-process.
 """
+import os
+import sys
+
+# So a fresh clone just runs: python examples/<name>.py
+# Python puts the *script's* directory on sys.path, not the working directory,
+# so without this the import fails for anyone who has not pip-installed first.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 from aegrail import Agent, ArgRuleSet, Budget, CapabilityGrant
 from aegrail.exceptions import PolicyDenied
 
