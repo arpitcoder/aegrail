@@ -172,7 +172,59 @@ argumentRules:
   #   be individually permitted. That needs the original delegation in
   #   scope, which is a semantic question.
   #
-  # And one that no tier here handles: sequence risk. read_secrets is
-  # allowed, http_post is allowed, read_secrets -> http_post is
-  # exfiltration. Per-call evaluation is structurally blind to it. The
-  # hash chain lets you find it afterwards; nothing here prevents it.
+  # Sequence risk used to be on that list. It is now its own tier,
+  # below — per-call evaluation is still structurally blind to it, so
+  # the rules are written against the trajectory instead.
+
+
+# ── Tier 4: the trajectory ────────────────────────────────────────────
+#
+# Everything above judges one call. These judge the order of several.
+# read_secret is allowed. http_post is allowed. read_secret then
+# http_post is exfiltration, and nothing above can see it, because
+# neither call is wrong on its own.
+#
+# Every window is bounded. Without one, a single secret read at startup
+# would restrict every outbound call for the life of the process, which
+# is unusable — and people respond to unusable contracts by removing
+# them. Two things happening close together is the suspicious part.
+
+sequenceRules:
+
+  - afterAny: ["*secret*", "*credential*", "get_parameter*", "*_token*"]
+    then: "http_*"
+    verdict: deny
+    withinSeconds: 600
+    reason: "outbound request shortly after reading a secret"
+
+  - afterAny: ["*secret*", "*credential*", "*_dump*", "*sql*"]
+    then: "*_upload*"
+    verdict: deny
+    withinSeconds: 600
+    reason: "upload shortly after reading secrets or bulk-reading data"
+
+  # The same shape with a different exit: instead of carrying the data
+  # out, make the place it already sits reachable from outside.
+  - afterAny: ["*_dump*", "*sql*", "*_download*"]
+    then: "*_public*"
+    verdict: deny
+    withinSeconds: 600
+    reason: "resource made public shortly after a bulk read"
+
+  # Ordering is the whole signal here. Disabling a log is ordinary
+  # maintenance. Disabling a log and then deleting something is the
+  # oldest shape in the book, and neither call is remarkable alone.
+  - afterAny: ["*_disable_log*", "*_disable_audit*", "*_stop_trail*"]
+    then: "*_delete*"
+    verdict: deny
+    withinSeconds: 1800
+    reason: "deletion after logging was disabled"
+
+  # Scaling a service down is reversible and often correct. Doing it
+  # right after draining the node its replicas were on removes the
+  # capacity that would have absorbed the drain.
+  - afterAny: ["k8s_drain_node*"]
+    then: "scale_deployment"
+    verdict: hitl
+    withinSeconds: 900
+    reason: "scaling down shortly after a node drain"
