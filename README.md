@@ -151,13 +151,42 @@ stop, because the sentinel is *smaller* than the threshold.
 ```yaml
 - afterAny: ["read_claim*", "read_policyholder*"]
   then: "http_*"
-  within_seconds: 600
+  withinSeconds: 600
   verdict: deny
   reason: outbound request shortly after reading policyholder data
 ```
 
 Reading a record is fine. Posting to a URL is fine. Doing both within the same
 minute is exfiltration, and no per-call rule can see it.
+
+`python examples/exfiltration.py`:
+
+```
+http_post(status.internal)                   posted 2 bytes to https://status.internal
+read_claim(C-1001)                           {'policyholder': 'A. Nigam', 'ssn': 'xxx-xx-1234'}
+http_post(status.internal)  [after the read] DENIED
+    outbound request shortly after reading policyholder data
+    (saw 'read_claim' 0s earlier)
+```
+
+The first and third calls are identical. Capability, arguments and budget all
+say yes to both; the only thing that changed is what the agent did in between.
+Deterministic and in-memory — no model is asked, and the denial replays the
+same way a year later.
+
+Two details that decide whether this is usable in production:
+
+**Only calls that actually ran arm a rule.** A blocked or failed read handed
+the agent nothing, so it must not restrict the rest of the session —
+otherwise the agent whose reads keep getting denied is the one that stops
+being able to work.
+
+**Every window is bounded.** Without `withinSeconds`, one read at startup
+restricts every outbound call for the life of the process. People respond to
+unusable contracts by deleting them.
+
+State is per-session and in-process: this sees one agent's trajectory, not a
+fleet. Correlating across agents and restarts is a control-plane job.
 
 ---
 
@@ -229,6 +258,19 @@ after an incident, not before one.
 That last row is the one people get wrong. A rule saying
 `tags.ephemeral != "true"` has to fire on a resource with *no* tags, or every
 untagged resource walks straight through the check designed to catch it.
+
+---
+
+## Examples
+
+Both run in-process. No API key, no services, no install:
+
+```bash
+git clone https://github.com/arpitcoder/aegrail && cd aegrail
+python examples/claims_triage.py    # capability, arguments, failing closed
+python examples/exfiltration.py     # two permitted calls, forbidden order
+python -m aegrail.verify ./audit.jsonl
+```
 
 ---
 
