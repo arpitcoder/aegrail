@@ -38,6 +38,7 @@ from .hitl import HITLClient
 from .judge import JudgeClient
 from .pending import PendingCall, PendingStore, Resumer
 from .policy import PolicyClient
+from .sequence import SequenceTracker
 from .traces import TraceClient
 from .verdict import Decision, Tier, Verdict, allow, deny, needs_human
 
@@ -82,6 +83,7 @@ class Agent:
         mode: Mode = Mode.ENFORCE,
         trace_arguments: bool = False,
         agent_id: Optional[str] = None,
+        sequence: Optional[SequenceTracker] = None,
     ):
         self.identity = identity
         self.budget = budget or Budget()
@@ -135,6 +137,11 @@ class Agent:
         # Argument rules ship with the contract. Empty is a valid state:
         # an agent with no rules still has the structural layer.
         self.arg_rules = arg_rules or ArgRuleSet()
+
+        # Rules over the trajectory rather than the call. Empty is the common
+        # case and costs nothing: with no rules the tracker short-circuits
+        # before it touches history.
+        self.sequence = sequence or SequenceTracker()
 
         # Every contract decision is also a trace. The runtime already
         # saw the call in order to rule on it, so the telemetry is a
@@ -442,6 +449,13 @@ class Agent:
             result = spec.fn(*args, **kwargs)
             elapsed_ms = int((time.monotonic() - started) * 1000)
 
+            # Only a call that actually ran arms a sequence rule. A blocked
+            # read never handed the agent the data, so it must not restrict
+            # what the rest of the session may do with it. This sits after
+            # the call rather than before it for the same reason: a tool that
+            # raised returned nothing to exfiltrate.
+            self.sequence.record(name)
+
             event = self.audit.record(
                 "tool.executed",
                 tool=name,
@@ -510,6 +524,12 @@ class Agent:
         decision = decision.combine(
             self.arg_rules.evaluate(name, call_args.get("kwargs", {}) or {})
         )
+
+        # Tier 2c: what has already happened this session. Each call above
+        # may be individually permissible — read a claim, post to a URL — and
+        # the pair still be exfiltration. Deterministic, in-memory, and placed
+        # before the judge so a sequence denial never pays for a model call.
+        decision = decision.combine(self.sequence.evaluate(name))
 
         # Tier 2b runs only where the rules still cannot tell: a tool
         # whose risk is in its arguments, that nothing has already
