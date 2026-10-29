@@ -84,6 +84,7 @@ class Agent:
         trace_arguments: bool = False,
         agent_id: Optional[str] = None,
         sequence: Optional[SequenceTracker] = None,
+        expect_manifest: Optional[Any] = None,
     ):
         self.identity = identity
         self.budget = budget or Budget()
@@ -142,6 +143,15 @@ class Agent:
         # case and costs nothing: with no rules the tracker short-circuits
         # before it touches history.
         self.sequence = sequence or SequenceTracker()
+
+        # The approved tool surface, if someone approved one. A hash pins it;
+        # a full manifest pins it *and* can say which tool moved. Read from
+        # the environment too, because the pin belongs to the deploy that was
+        # reviewed rather than to the source file — the same reason you pin a
+        # container digest in the manifest and not in the Dockerfile.
+        self._expect_manifest = expect_manifest or os.environ.get(
+            "AEGRAIL_EXPECT_MANIFEST"
+        )
 
         # Every contract decision is also a trace. The runtime already
         # saw the call in order to rule on it, so the telemetry is a
@@ -226,10 +236,16 @@ class Agent:
             manifest_hash=man.digest(),
             tools=list(man.tools),
             destructive=sorted(man.destructive),
+            # Per-tool surface digests, so a later attestation can be diffed
+            # against this one by anyone holding the chain — not only by a
+            # process that happens to still have the approved manifest.
+            surfaces=dict(man.surfaces),
             granted=sorted(self.capability.allowed_tools),
             configured=self.capability.configured,
             violations=violations,
         )
+
+        self._check_manifest_pin(man)
 
         if violations:
             msg = (
@@ -545,6 +561,70 @@ class Agent:
             )
 
         return decision
+
+    def _check_manifest_pin(self, man: ToolManifest) -> None:
+        """Refuse to run a toolset that is not the one that was approved.
+
+        Attestation has always computed this hash and written it down. Writing
+        it down is not change management — nobody reads an audit chain at
+        startup. A pin is the part that makes the record load-bearing: if the
+        surface moved since review, this process does not start.
+
+        The failure is deliberately loud and deliberately annoying. A legitimate
+        deploy updates the pin, which is the review step being asked for. A pin
+        that warns and continues is decoration.
+        """
+        pin = self._expect_manifest
+        if not pin:
+            return
+
+        approved = None
+        if isinstance(pin, ToolManifest):
+            approved, expected = pin, pin.digest()
+        elif isinstance(pin, dict):
+            approved = ToolManifest(
+                tools=tuple(pin.get("tools", ())),
+                destructive=frozenset(pin.get("destructive", ())),
+                surfaces=tuple(sorted((pin.get("surfaces") or {}).items())),
+            )
+            expected = pin.get("manifest_hash") or approved.digest()
+        else:
+            expected = str(pin).split(":", 1)[-1].strip()
+
+        actual = man.digest()
+        if actual == expected:
+            return
+
+        # A hash alone cannot say what moved. A full approved manifest can,
+        # and naming the tool is most of the value of catching this at all.
+        detail = man.drift(approved) if approved is not None else None
+        self.audit.record(
+            "capability.drift",
+            identity=self.identity,
+            expected=expected,
+            actual=actual,
+            drift=detail,
+        )
+
+        where = ""
+        if detail:
+            parts = [f"{k}: {', '.join(v)}" for k, v in detail.items() if v]
+            where = " — " + "; ".join(parts) if parts else ""
+
+        msg = (
+            f"agent '{self.identity}' has a tool surface that does not match "
+            f"the approved manifest{where}. Expected {expected[:16]}…, got "
+            f"{actual[:16]}…. A tool's name, description, signature or "
+            f"destructive flag has changed since review. Re-review and update "
+            f"the pin, or pin the manifest this build actually produces."
+        )
+
+        if not self.mode.enforces:
+            # Shadow mode promises an onboarding agent will not be broken by
+            # us. Breaking it at startup is still breaking it.
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            return
+        raise CapabilityError(msg)
 
     def _require_human(self, name, spec, call_args, span, decision=None) -> str:
         """Block on human approval. Timeout denies."""
