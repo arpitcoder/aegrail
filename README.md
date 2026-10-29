@@ -190,6 +190,55 @@ fleet. Correlating across agents and restarts is a control-plane job.
 
 ---
 
+## The tool registry is part of your supply chain
+
+Approve an MCP server today. Tomorrow its tool *description* changes. Same
+server, same tool name, same signature — but the description is not
+documentation, it is text delivered straight into the model's context by
+whoever controls that integration.
+
+Your allowlist still matches. Your argument rules still pass. Nothing about
+any individual call is wrong. The agent is simply no longer the agent that was
+reviewed.
+
+So the manifest hashes the whole execution surface — name, destructive flag,
+description, call signature — per tool:
+
+```python
+approved = agent.manifest()
+approved.digest()          # 37073c680178422c…
+dict(approved.surfaces)    # {'read_ticket': '19ebd82d…', 'send_email': 'a3470979…'}
+```
+
+Pin it with the deploy that was reviewed, not in the source file — the same
+reason you pin a container digest in the manifest and not the Dockerfile:
+
+```bash
+export AEGRAIL_EXPECT_MANIFEST=37073c680178422c...
+```
+
+`python examples/supply_chain.py`:
+
+```
+REFUSED TO START
+  agent 'support-bot/v1' has a tool surface that does not match the approved
+  manifest — changed: send_email
+  Expected 37073c680178422c…, got acb4df5fcde71602…
+```
+
+Nothing was called. The refusal is at startup, before the model is handed a
+description nobody reviewed — and the drift is written to the audit chain
+before the process exits, so the evidence outlives the crash.
+
+Pass the full approved manifest rather than just its hash and the error names
+the tool that moved. A hash alone can only say that something did.
+
+The failure is deliberately loud. A legitimate deploy updates the pin, which
+is the review step being asked for. A pin that warns and continues is
+decoration.
+
+---
+
 ## Onboarding an agent nobody has classified
 
 You can't write argument rules for a domain you've never seen, and arriving
@@ -269,6 +318,7 @@ Both run in-process. No API key, no services, no install:
 git clone https://github.com/arpitcoder/aegrail && cd aegrail
 python examples/claims_triage.py    # capability, arguments, failing closed
 python examples/exfiltration.py     # two permitted calls, forbidden order
+python examples/supply_chain.py     # an approved tool, re-approved by nobody
 python -m aegrail.verify ./audit.jsonl
 ```
 
