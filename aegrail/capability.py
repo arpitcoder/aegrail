@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import inspect
 import json
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
@@ -49,18 +50,62 @@ class CapabilityError(Exception):
     """Raised when an agent's tools cannot be reconciled with its grant."""
 
 
+# Bumped whenever the hashed payload changes shape, so an old pinned hash
+# fails loudly as a version mismatch rather than looking like tampering.
+MANIFEST_SCHEMA = 2
+
+
 @dataclass(frozen=True)
 class ToolManifest:
-    """The tools a process actually registered, and a hash over them.
+    """The tools a process registered, and a hash over their execution surface.
 
-    The hash covers names and their destructive flags, sorted, so it is stable
-    across process restarts and dict ordering but changes the moment the agent
-    gains a tool or reclassifies one. That is exactly the event worth noticing:
-    a deploy that quietly widened what an agent can reach.
+    "Execution surface" is deliberate, and it is wider than the name. Four
+    things decide what a tool can do to you:
+
+        name          what the contract and the grant are written against
+        destructive   whether the platform treats it as irreversible
+        description   the text the *model* reads when deciding to call it
+        signature     the arguments it accepts
+
+    Schema 1 hashed the first two. That left the most dangerous change of all
+    invisible: an integration whose description is rewritten keeps its name,
+    keeps its flag, and produces an identical hash. The tool the security
+    review approved and the tool the model is now reading are different tools,
+    and attestation said nothing had changed.
+
+    Description is not documentation. It is an instruction delivered straight
+    into the model's context by whoever controls the integration, which makes
+    it part of the supply chain and a production change when it moves.
     """
 
     tools: tuple = ()
     destructive: frozenset = frozenset()
+    # name -> digest over that one tool's surface. Per-tool rather than one
+    # bulk hash so a mismatch can say *which* tool moved, which is the
+    # difference between an alert someone acts on and one they mute.
+    surfaces: tuple = ()
+
+    @staticmethod
+    def _surface(name: str, spec) -> str:
+        description = (getattr(spec, "description", "") or "").strip()
+        fn = getattr(spec, "fn", None)
+        try:
+            signature = str(inspect.signature(fn)) if fn is not None else ""
+        except (TypeError, ValueError):
+            # Builtins and some C callables have no introspectable signature.
+            # Absence is recorded as absence rather than guessed at.
+            signature = ""
+        payload = json.dumps(
+            {
+                "name": name,
+                "destructive": bool(getattr(spec, "destructive", False)),
+                "description": description,
+                "signature": signature,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     @staticmethod
     def from_specs(specs: dict) -> "ToolManifest":
@@ -68,19 +113,39 @@ class ToolManifest:
         destructive = frozenset(
             n for n, s in specs.items() if getattr(s, "destructive", False)
         )
-        return ToolManifest(tools=names, destructive=destructive)
+        surfaces = tuple(
+            (n, ToolManifest._surface(n, specs[n])) for n in names
+        )
+        return ToolManifest(tools=names, destructive=destructive,
+                            surfaces=surfaces)
 
     def digest(self) -> str:
         payload = json.dumps(
-            [[n, n in self.destructive] for n in self.tools],
+            {"schema": MANIFEST_SCHEMA, "tools": [list(s) for s in self.surfaces]},
             separators=(",", ":"),
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
+    def drift(self, other: "ToolManifest") -> dict:
+        """What changed between an approved manifest and this one.
+
+        Named rather than counted. "3 tools changed" is not actionable;
+        "send_email's description was rewritten" is.
+        """
+        mine, theirs = dict(self.surfaces), dict(other.surfaces)
+        return {
+            "added": sorted(set(mine) - set(theirs)),
+            "removed": sorted(set(theirs) - set(mine)),
+            "changed": sorted(n for n in set(mine) & set(theirs)
+                              if mine[n] != theirs[n]),
+        }
+
     def as_dict(self) -> dict:
         return {
+            "schema": MANIFEST_SCHEMA,
             "tools": list(self.tools),
             "destructive": sorted(self.destructive),
+            "surfaces": dict(self.surfaces),
             "manifest_hash": self.digest(),
         }
 
