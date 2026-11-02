@@ -119,6 +119,9 @@ class TraceClient:
         session_id: str = "",
         error_message: str = "",
         payload: Optional[dict] = None,
+        trace_id: str = "",
+        span_id: str = "",
+        parent_span_id: str = "",
     ) -> None:
         """Queue one trace. Never raises, never blocks."""
         if not self.enabled:
@@ -138,6 +141,16 @@ class TraceClient:
             "tool_names": tool_names or [],
             "session_id": session_id,
         }
+        # W3C ids, taken from the live OTel span when there is one. The
+        # trace model has carried these fields since it was written and
+        # nothing populated them, which is why a session rendered as a flat
+        # list of calls instead of a tree.
+        if trace_id:
+            body["trace_id"] = trace_id
+        if span_id:
+            body["span_id"] = span_id
+        if parent_span_id:
+            body["parent_span_id"] = parent_span_id
         if self.agent_id:
             body["agent_id"] = self.agent_id
         if error_message:
