@@ -239,6 +239,56 @@ decoration.
 
 ---
 
+## The stop button
+
+Fleet policy carries a halt. Set it and every call denies at the deterministic
+tier — including reads, because an operator who stopped the fleet mid-incident
+did not mean "keep feeding the model".
+
+```python
+agent.halt("incident 4471")     # process-local, reachable from a signal handler
+agent.resume()
+agent.halted                    # local halt OR fleet policy
+```
+
+The hard half is not the button. It is the moment the agent cannot hear it.
+
+An SDK that keeps its last-known policy forever has a kill switch that anyone
+who drops egress can defeat — including an agent that has been talked into
+dropping its own. So the policy snapshot is timestamped, and an agent that has
+not heard from the control plane within `max_policy_age` degrades:
+
+```python
+Agent(identity="ops-bot/v1", max_policy_age=300)   # seconds; 0 disables
+```
+
+```
+read_runbook      runbook db
+restart_service   DENIED
+                  policy last confirmed 3600s ago, over the 300s limit —
+                  irreversible tools are revoked until the control plane is
+                  reachable again
+```
+
+**Reads keep working; irreversible tools are revoked.** Failing fully closed
+would mean a control-plane blip stops a customer's production fleet, and that
+is a safety control people disable within a week. Failing open means the
+switch is defeated by a cut cable. Splitting on reversibility keeps the agent
+useful while making the switch undefeatable for the actions that matter.
+
+An agent that cannot hear the kill switch assumes it was pressed — but only
+for the actions that would have mattered if it had been.
+
+Two details that keep it from crying wolf: a `304 Not Modified` refreshes the
+age, since it proves the control plane is reachable and the policy unchanged;
+and the degrade applies only to an agent that is actually managed, because
+offline development is not a degraded state.
+
+Halts, resumes and degraded denials are all chain events — who stopped it,
+when, and what was refused afterwards.
+
+---
+
 ## Onboarding an agent nobody has classified
 
 You can't write argument rules for a domain you've never seen, and arriving
@@ -319,6 +369,7 @@ git clone https://github.com/arpitcoder/aegrail && cd aegrail
 python examples/claims_triage.py    # capability, arguments, failing closed
 python examples/exfiltration.py     # two permitted calls, forbidden order
 python examples/supply_chain.py     # an approved tool, re-approved by nobody
+python examples/kill_switch.py      # stopping an agent, and losing the ability to
 python -m aegrail.verify ./audit.jsonl
 ```
 
