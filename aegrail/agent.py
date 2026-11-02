@@ -25,6 +25,7 @@ import functools
 import os
 import time
 import warnings
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from . import otel
@@ -450,6 +451,12 @@ class Agent:
             },
         ) as span:
 
+            # Conventions mark call arguments opt-in, which is the same
+            # decision trace_arguments already encodes. One flag, both sinks.
+            if self.trace_arguments:
+                span.set_raw("gen_ai.tool.call.arguments",
+                             repr(call_args.get("kwargs", {}) or {}))
+
             decision = self._evaluate(spec, name, call_args)
             span.set("verdict", str(decision.verdict))
             span.set("decided_by", str(decision.tier))
@@ -487,12 +494,15 @@ class Agent:
                     **decision.to_audit(),
                 )
                 span.set("audit_hash", event["hash"])
+                trace_id, span_id = span.context()
                 self.traces.record(
                     operation="tool_call",
                     status="blocked",
                     tool_names=[name],
                     session_id=self.identity,
                     error_message=decision.why(),
+                    trace_id=trace_id,
+                    span_id=span_id,
                     payload={
                         "audit_hash": event["hash"],
                         **decision.to_audit(),
@@ -526,12 +536,15 @@ class Agent:
                 budget=self.budget.snapshot(),
             )
             span.allow(audit_hash=event["hash"])
+            trace_id, span_id = span.context()
             self.traces.record(
                 operation="tool_call",
                 status="ok",
                 duration_ms=elapsed_ms,
                 tool_names=[name],
                 session_id=self.identity,
+                trace_id=trace_id,
+                span_id=span_id,
                 payload={
                     **self._traced_args(call_args),
                     "verdict": "allowed",
@@ -611,6 +624,21 @@ class Agent:
             )
 
         return decision
+
+    @contextmanager
+    def session(self, *, model: str = ""):
+        """Group a turn's tool calls under one `invoke_agent` span.
+
+        Optional, and worth the one line: without a parent span the calls
+        are siblings at the root, and a trace answers "what ran" but never
+        "what was it doing at the time".
+
+            with agent.session():
+                agent.call_tool("read_claim", claim_id="C-1001")
+                agent.call_tool("write_note", claim_id="C-1001", text="…")
+        """
+        with otel.agent_span(self.identity, model=model) as span:
+            yield span
 
     # ── the stop button ─────────────────────────────────────────────
     def halt(self, reason: str = "halted locally", *, mode: str = "immediate",
