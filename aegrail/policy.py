@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .credentials import CredentialSource
 from typing import Optional
@@ -34,6 +35,24 @@ class PolicySnapshot:
     allowed_models: set = field(default_factory=set)  # empty == all allowed
     policy_hash: str = ""
     source: str = "local-default"
+
+    # ── the stop button ──────────────────────────────────────────────
+    # Set fleet-wide, read on every call, and the only clause that needs
+    # no argument, no tool name and no reasoning to apply.
+    halted: bool = False
+    halt_reason: str = ""
+
+    # When this snapshot was actually fetched. Monotonic, because a kill
+    # switch must not be defeatable by moving the clock: NTP steps, and
+    # a container that resumes from a snapshot sees wall time jump.
+    # Zero means "never successfully fetched".
+    fetched_at: float = 0.0
+
+    def age(self, now: Optional[float] = None) -> float:
+        """Seconds since this policy was last confirmed with the server."""
+        if not self.fetched_at:
+            return float("inf")
+        return max(0.0, (now if now is not None else time.monotonic()) - self.fetched_at)
 
 
 class PolicyClient:
@@ -115,10 +134,12 @@ class PolicyClient:
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status == 304:
+                    self._touch()
                     return
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
+                self._touch()
                 return
             raise
 
@@ -140,6 +161,9 @@ class PolicyClient:
             deny_tools=set(spec.get("deny_tools") or []),
             allowed_tools=set(spec.get("allowed_tools") or []),
             allowed_models=set(spec.get("allowed_models") or []),
+            halted=bool(spec.get("halted", False)),
+            halt_reason=str(spec.get("halt_reason", "") or ""),
+            fetched_at=time.monotonic(),
             policy_hash=str(data.get("policy_hash", "")),
             source=(
                 ", ".join(s.get("name", "?") for s in sources) if sources else "mavops"
@@ -156,11 +180,36 @@ class PolicyClient:
             except Exception:
                 pass
 
+    def _touch(self) -> None:
+        """Mark the current snapshot as freshly confirmed.
+
+        A 304 carries no body but is still proof the control plane is
+        reachable and the policy has not changed — which is exactly what
+        staleness is asking about. Without this, an agent whose policy is
+        simply stable would drift into the degraded state while perfectly
+        healthy, and nothing erodes trust in a safety control faster than
+        it firing when nothing is wrong.
+        """
+        with self._lock:
+            self._snapshot = replace(self._snapshot, fetched_at=time.monotonic())
+
     # ── reads ───────────────────────────────────────────────────────
     @property
     def snapshot(self) -> PolicySnapshot:
         with self._lock:
             return self._snapshot
+
+    @property
+    def managed(self) -> bool:
+        """Is this agent configured to answer to a control plane at all?
+
+        Staleness is only meaningful for an agent that is supposed to be in
+        touch with something. Offline development is not a degraded state.
+        """
+        try:
+            return bool(self.credentials.get())
+        except Exception:
+            return False
 
     def requires_hitl(self, action: str) -> bool:
         snap = self.snapshot
