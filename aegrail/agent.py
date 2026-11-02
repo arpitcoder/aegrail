@@ -51,9 +51,17 @@ class _ToolSpec:
         destructive: bool,
         description: str,
         inspect_args: bool = False,
+        begins: Optional[str] = None,
+        completes: Optional[str] = None,
     ):
         self.fn = fn
         self.destructive = destructive
+        # A critical section this call opens or closes. The pair is what
+        # makes "safe state" a thing a program can check rather than a
+        # thing a person asserts: an agent is at a safe point when no
+        # section it opened is still open.
+        self.begins = begins
+        self.completes = completes
         # Set when the tool's risk lives in its arguments rather than its
         # name — execute_sql, run_shell, http_post. These are the calls a
         # denylist cannot classify, so Tier 2 looks at the actual values.
@@ -160,6 +168,14 @@ class Agent:
         self.max_policy_age = max_policy_age
         self._halted = False
         self._halt_reason = ""
+        self._halt_mode = "immediate"
+        self._halt_at = 0.0
+        # How long a controlled halt may wait for open work to finish. A
+        # controlled stop that can be held open indefinitely is not a stop:
+        # an agent that never closes its section would outlive the button.
+        self._halt_escalate_after = 60.0
+        # Critical sections this agent has opened and not yet closed.
+        self._open_sections: list = []
 
         # Every contract decision is also a trace. The runtime already
         # saw the call in order to rule on it, so the telemetry is a
@@ -351,6 +367,8 @@ class Agent:
         destructive: bool = False,
         description: str = "",
         inspect_args: bool = False,
+        begins: Optional[str] = None,
+        completes: Optional[str] = None,
     ):
         """Register a callable as a contract-governed tool.
 
@@ -362,6 +380,14 @@ class Agent:
         arguments rather than its name — execute_sql, run_shell,
         http_post. Those calls are additionally sent to the Tier 2 judge,
         which can escalate them but never approve past Tier 1.
+
+        `begins` / `completes` name a critical section — a span of work
+        that must not be left half-done. `begins="payout"` opens it,
+        `completes="payout"` closes it. A controlled halt waits for open
+        sections to close before it takes full effect, and refuses to let
+        a new one open in the meantime. Without these an agent has no
+        boundaries, so a controlled halt and an immediate one are the
+        same thing.
         """
 
         def decorate(fn: Callable) -> Callable:
@@ -370,6 +396,8 @@ class Agent:
                 destructive=destructive,
                 description=description,
                 inspect_args=inspect_args,
+                begins=begins,
+                completes=completes,
             )
             self._tools[spec.name] = spec
 
@@ -487,6 +515,7 @@ class Agent:
             # the call rather than before it for the same reason: a tool that
             # raised returned nothing to exfiltrate.
             self.sequence.record(name)
+            self._enter_sections(spec, name)
 
             event = self.audit.record(
                 "tool.executed",
@@ -584,24 +613,93 @@ class Agent:
         return decision
 
     # ── the stop button ─────────────────────────────────────────────
-    def halt(self, reason: str = "halted locally") -> None:
-        """Stop this agent acting, now. Survives nothing — it is process-local.
+    def halt(self, reason: str = "halted locally", *, mode: str = "immediate",
+             escalate_after: float = 60.0) -> None:
+        """Stop this agent acting. Process-local; the fleet switch is policy.
 
-        The fleet-wide switch lives in policy; this is the one you can reach
-        from a signal handler, a readiness probe or a test.
+        Two modes, and the distinction is the one machinery safety has used
+        for decades (ISO 13850 calls them stop categories):
+
+        **immediate** — nothing else runs. Correct when you believe the agent
+        is compromised, and correct by default: when in doubt you want it to
+        stop, not to negotiate.
+
+        **controlled** — open critical sections are allowed to close, and
+        nothing new may open. The agent comes to rest at a boundary instead
+        of mid-sequence. Use it when a half-finished sequence is worse than a
+        few more seconds of running, which is most operational work and
+        almost no security incidents.
+
+        A controlled halt escalates to immediate after `escalate_after`
+        seconds. Without that, an agent that simply never closes its section
+        outlives the stop button, which is the one failure a stop button may
+        not have.
+
+        Note what this does *not* do: it stops tool calls that go through
+        this agent. It does not revoke the process's credentials or close its
+        connections. A kill switch that leaves the keys live is a well-known
+        way to feel safe without being safe — see "Honest limits".
         """
+        if mode not in ("immediate", "controlled"):
+            raise ValueError("mode must be 'immediate' or 'controlled'")
+
         self._halted, self._halt_reason = True, reason
-        self.audit.record("agent.halted", identity=self.identity,
-                          source="local", reason=reason)
+        self._halt_mode = mode
+        self._halt_at = time.monotonic()
+        self._halt_escalate_after = escalate_after
+        self.audit.record(
+            "agent.halted", identity=self.identity, source="local",
+            reason=reason, mode=mode,
+            open_sections=list(self._open_sections),
+        )
+        # A controlled halt with nothing open is already at rest. Say so,
+        # rather than leaving an operator to infer it from silence.
+        if mode == "controlled" and not self._open_sections:
+            self._record_safe_point()
 
     def resume(self) -> None:
         self._halted, self._halt_reason = False, ""
+        self._halt_mode, self._halt_at = "immediate", 0.0
         self.audit.record("agent.resumed", identity=self.identity,
                           source="local")
 
     @property
     def halted(self) -> bool:
         return self._halted or self.policy.snapshot.halted
+
+    @property
+    def at_safe_point(self) -> bool:
+        """No critical section is open.
+
+        This is what "a safe state" means here, and it is deliberately
+        checkable rather than asserted. A safe state is not a prior state:
+        it is one in which nothing further is half-done.
+        """
+        return not self._open_sections
+
+    @property
+    def open_sections(self) -> list:
+        return list(self._open_sections)
+
+    def _record_safe_point(self) -> None:
+        self.audit.record("agent.safe_point", identity=self.identity,
+                          reason=self._halt_reason)
+
+    def _enter_sections(self, spec, name: str) -> None:
+        """Track a critical section across a call that actually ran."""
+        if spec.begins:
+            self._open_sections.append(spec.begins)
+        if spec.completes and spec.completes in self._open_sections:
+            # Close the most recent matching section. Nesting the same name
+            # is unusual but legal, and closing the oldest would leave the
+            # inner one orphaned.
+            for i in range(len(self._open_sections) - 1, -1, -1):
+                if self._open_sections[i] == spec.completes:
+                    del self._open_sections[i]
+                    break
+            if self._halted and self._halt_mode == "controlled" \
+                    and not self._open_sections:
+                self._record_safe_point()
 
     def _halt_check(self, spec) -> Decision:
         """The stop button, and what to do when nobody can press it.
@@ -632,7 +730,7 @@ class Agent:
         agent would teach them to raise the timeout until it never fires.
         """
         if self._halted:
-            return deny(f"agent is halted: {self._halt_reason}")
+            return self._local_halt_check(spec)
 
         snap = self.policy.snapshot
         if snap.halted:
@@ -656,6 +754,38 @@ class Agent:
             f"policy last confirmed {pretty}, over the {self.max_policy_age}s "
             f"limit — irreversible tools are revoked until the control plane "
             f"is reachable again"
+        )
+
+    def _local_halt_check(self, spec) -> Decision:
+        """A local halt, honouring its mode.
+
+        An immediate halt denies everything. A controlled halt denies
+        everything except the calls that close work already in flight —
+        and only until the escalation deadline, after which it is an
+        immediate halt like any other.
+        """
+        why = self._halt_reason
+        if self._halt_mode != "controlled":
+            return deny(f"agent is halted: {why}")
+
+        if not self._open_sections:
+            return deny(f"agent is halted at a safe point: {why}")
+
+        waited = time.monotonic() - self._halt_at
+        if waited >= self._halt_escalate_after:
+            return deny(
+                f"agent is halted: {why} — controlled stop gave up after "
+                f"{int(waited)}s with {', '.join(self._open_sections)} still "
+                f"open, escalated to an immediate stop"
+            )
+
+        if spec.completes and spec.completes in self._open_sections:
+            return allow()
+
+        return deny(
+            f"agent is halted: {why} — controlled stop is waiting for "
+            f"{', '.join(self._open_sections)} to close, and this call does "
+            f"not close it"
         )
 
     def _check_manifest_pin(self, man: ToolManifest) -> None:
