@@ -386,6 +386,61 @@ changes: `tool.would_deny` is not `tool.denied`.
 
 ---
 
+## Traces your dashboard already understands
+
+Aegrail emits the OpenTelemetry **GenAI semantic conventions**, not a span
+shape of its own. `execute_tool` and `gen_ai.tool.name` already mean something
+in Datadog, Grafana and Honeycomb — so enforcement appears in the views you
+have, with nothing of ours installed.
+
+```bash
+pip install 'aegrail[otel]'
+python examples/otel_traces.py
+```
+
+```
+invoke_agent claims-triage   [INTERNAL]
+    gen_ai.operation.name      invoke_agent
+    gen_ai.agent.name          claims-triage
+    gen_ai.request.model       claude-opus-5
+
+  execute_tool read_claim   [INTERNAL]
+      gen_ai.tool.name           read_claim
+      aegrail.verdict            allowed
+      aegrail.decided_by         deterministic
+
+  execute_tool delete_claim   [INTERNAL]
+      gen_ai.tool.name           delete_claim
+      aegrail.verdict            blocked
+      aegrail.decided_by         deterministic
+      error.type                 PolicyDenied
+```
+
+What the conventions do not cover — the verdict, the tier that decided it, the
+audit digest — stays under `aegrail.*`. Dropping those to look compliant would
+throw away the only part of this telemetry nobody else emits.
+
+`agent.session()` opens the `invoke_agent` span that the tool calls nest under.
+It is optional, and worth the one line: without a parent, calls are siblings at
+the root and a trace tells you what ran but never what the agent was doing at
+the time.
+
+```python
+with agent.session(model="claude-opus-5"):
+    agent.call_tool("read_claim", claim_id="C-1001")
+    agent.call_tool("write_note", claim_id="C-1001", text="triaged")
+```
+
+Call arguments are **opt-in**, matching both the conventions and
+`trace_arguments=False`. One flag governs the span and the control plane
+together.
+
+Conventions move — they are still marked Development and have already changed
+repositories. Every span carries `aegrail.conventions` so a trace says which
+spelling it used.
+
+---
+
 ## Audit
 
 Every decision is appended to a SHA-256 hash chain, linked **in-process before
@@ -438,6 +493,7 @@ python examples/exfiltration.py     # two permitted calls, forbidden order
 python examples/supply_chain.py     # an approved tool, re-approved by nobody
 python examples/kill_switch.py      # stopping an agent, and losing the ability to
 python examples/controlled_stop.py  # coming to rest at a boundary, then the report
+python examples/otel_traces.py      # the span tree, needs the otel extra
 python -m aegrail.verify ./audit.jsonl
 ```
 
