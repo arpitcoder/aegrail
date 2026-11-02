@@ -284,8 +284,75 @@ age, since it proves the control plane is reachable and the policy unchanged;
 and the degrade applies only to an agent that is actually managed, because
 offline development is not a degraded state.
 
-Halts, resumes and degraded denials are all chain events — who stopped it,
-when, and what was refused afterwards.
+### Stopping at a boundary, not mid-sequence
+
+An immediate halt is right when you think the agent is compromised. It is
+wrong for most operational work: an agent frozen between "took the service out
+of rotation" and "put it back" has stopped *and* left a mess.
+
+Tools can name the critical section they open and close:
+
+```python
+@agent.tool(begins="rotation")
+def drain(svc): ...
+
+@agent.tool(completes="rotation")
+def undrain(svc): ...
+
+agent.halt("deploy window closed", mode="controlled")
+```
+
+```
+read_status(api)   DENIED   controlled stop is waiting for rotation to close,
+                            and this call does not close it
+drain(web)         DENIED   (same)
+undrain(api)       undrained api
+read_status(api)   DENIED   agent is halted at a safe point
+```
+
+Only the call that closes open work gets through. Then the agent is at rest
+and nothing more runs. `agent.at_safe_point` is a property you can check, not
+a claim — **a safe state is not a prior state**, it is one where nothing is
+half-done.
+
+A controlled stop escalates to an immediate one after `escalate_after`
+seconds. An agent that simply never finishes must not outlive the button.
+
+### Afterwards: a report, not a rollback
+
+```
+python -m aegrail.incident ./audit.jsonl
+```
+
+```
+AGENT STOPPED   2026-11-02 10:18:57   (controlled)
+reason          deploy window closed
+open at stop    rotation
+safe point      reached — no work was left half-done
+
+Cannot be taken back (0)
+  nothing — no irreversible action ran
+
+Ran, but changed nothing irreversibly (3)
+  10:18:57  read_status(svc='api')
+  10:18:57  drain(svc='api')
+  10:18:57  undrain(svc='api')
+```
+
+Built entirely from the hash chain, so it is as tamper-evident as the actions
+were. It deliberately undoes nothing:
+
+- Unwinding during an incident means running new writes with code in a process
+  you have just decided not to trust.
+- Compensation is not inverse. Restarting a service gives you a cold cache and
+  a new PID, not the state you had.
+- The post-incident state is the evidence. Reverting it automatically
+  bulldozes what an investigator needs.
+
+A human reads it and decides. Slower, and right.
+
+Halts, resumes, safe points and degraded denials are all chain events — who
+stopped it, when, what was open, and what was refused afterwards.
 
 ---
 
@@ -370,6 +437,7 @@ python examples/claims_triage.py    # capability, arguments, failing closed
 python examples/exfiltration.py     # two permitted calls, forbidden order
 python examples/supply_chain.py     # an approved tool, re-approved by nobody
 python examples/kill_switch.py      # stopping an agent, and losing the ability to
+python examples/controlled_stop.py  # coming to rest at a boundary, then the report
 python -m aegrail.verify ./audit.jsonl
 ```
 
