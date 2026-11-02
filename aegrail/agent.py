@@ -85,6 +85,7 @@ class Agent:
         agent_id: Optional[str] = None,
         sequence: Optional[SequenceTracker] = None,
         expect_manifest: Optional[Any] = None,
+        max_policy_age: int = 300,
     ):
         self.identity = identity
         self.budget = budget or Budget()
@@ -152,6 +153,13 @@ class Agent:
         self._expect_manifest = expect_manifest or os.environ.get(
             "AEGRAIL_EXPECT_MANIFEST"
         )
+
+        # How long an agent may keep acting on a policy the control plane has
+        # not confirmed. See _halt_check for why this does not simply deny
+        # everything, and why it applies only to a managed agent.
+        self.max_policy_age = max_policy_age
+        self._halted = False
+        self._halt_reason = ""
 
         # Every contract decision is also a trace. The runtime already
         # saw the call in order to rule on it, so the telemetry is a
@@ -322,10 +330,18 @@ class Agent:
             "policy.applied",
             policy_hash=snap.policy_hash,
             source=snap.source,
+            halted=snap.halted,
             deny_tools=sorted(snap.deny_tools),
             require_hitl_for=sorted(snap.require_hitl_for),
             budget=self.budget.snapshot(),
         )
+        # Its own event, not a field on policy.applied. "The fleet was
+        # stopped at 14:02" is the line someone goes looking for during an
+        # incident, and it should not require reading every policy update
+        # to find it.
+        if snap.halted:
+            self.audit.record("agent.halted", identity=self.identity,
+                              source=snap.source, reason=snap.halt_reason)
 
     # ── tool registration ───────────────────────────────────────────
     def tool(
@@ -513,6 +529,11 @@ class Agent:
         """
         decision = allow()
 
+        # Before anything else. A halt needs no tool name, no arguments and
+        # no reasoning to apply, and it must not be reachable only after a
+        # cheaper check happens to pass.
+        decision = decision.combine(self._halt_check(spec))
+
         # Layer 2 first. If the tool is not this agent's to hold, nothing
         # further is worth evaluating: no argument is acceptable for a tool
         # it should never have registered, and the denial does not depend on
@@ -561,6 +582,81 @@ class Agent:
             )
 
         return decision
+
+    # ── the stop button ─────────────────────────────────────────────
+    def halt(self, reason: str = "halted locally") -> None:
+        """Stop this agent acting, now. Survives nothing — it is process-local.
+
+        The fleet-wide switch lives in policy; this is the one you can reach
+        from a signal handler, a readiness probe or a test.
+        """
+        self._halted, self._halt_reason = True, reason
+        self.audit.record("agent.halted", identity=self.identity,
+                          source="local", reason=reason)
+
+    def resume(self) -> None:
+        self._halted, self._halt_reason = False, ""
+        self.audit.record("agent.resumed", identity=self.identity,
+                          source="local")
+
+    @property
+    def halted(self) -> bool:
+        return self._halted or self.policy.snapshot.halted
+
+    def _halt_check(self, spec) -> Decision:
+        """The stop button, and what to do when nobody can press it.
+
+        Two cases, and the second is the one that decides whether any of
+        this is worth having.
+
+        **Halted.** Everything denies. No exceptions for reads: if an
+        operator stopped the fleet mid-incident, a read that feeds the next
+        model call is not neutral.
+
+        **Stale.** The agent has not heard from the control plane within
+        `max_policy_age`. This is the case a kill switch exists for and the
+        one most products get wrong. Fail open and the switch is defeated by
+        anyone who can drop egress — including an agent that has been talked
+        into killing its own network. Fail closed and a control-plane blip
+        stops a customer's production fleet, which is a product they turn
+        off within the week.
+
+        So it splits on reversibility: destructive tools are revoked,
+        everything else keeps working. An agent that cannot hear the kill
+        switch assumes it was pressed, but only for the actions that would
+        matter if it had been. The agent degrades instead of dying, and the
+        half you would actually want stopped is stopped.
+
+        Only for a *managed* agent. With no control plane configured there is
+        nothing to be out of touch with, and degrading a developer's laptop
+        agent would teach them to raise the timeout until it never fires.
+        """
+        if self._halted:
+            return deny(f"agent is halted: {self._halt_reason}")
+
+        snap = self.policy.snapshot
+        if snap.halted:
+            return deny(
+                "fleet policy has halted this agent"
+                + (f": {snap.halt_reason}" if snap.halt_reason else "")
+            )
+
+        if not self.max_policy_age or not self.policy.managed:
+            return allow()
+
+        age = snap.age()
+        if age <= self.max_policy_age:
+            return allow()
+
+        if not spec.destructive:
+            return allow()
+
+        pretty = "never" if age == float("inf") else f"{int(age)}s ago"
+        return deny(
+            f"policy last confirmed {pretty}, over the {self.max_policy_age}s "
+            f"limit — irreversible tools are revoked until the control plane "
+            f"is reachable again"
+        )
 
     def _check_manifest_pin(self, man: ToolManifest) -> None:
         """Refuse to run a toolset that is not the one that was approved.
